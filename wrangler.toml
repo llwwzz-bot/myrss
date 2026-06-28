@@ -1,0 +1,25 @@
+﻿name = "rss-collector"
+main = "src/webhook.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+TELEGRAM_BOT_TOKEN = "8642997300:AAEyzILFoJz4dh5S7L3xeeN676IUtQtdsP0"
+FEISHU_WEBHOOK_URL = ""
+ALLOWED_USERS = "7553610097"
+
+[[queues.producers]]
+queue = "collect-queue"
+binding = "COLLECT_QUEUE"
+
+[[queues.consumers]]
+queue = "collect-queue"
+max_batch_size = 1
+max_batch_timeout = 5
+
+[[r2_buckets]]
+binding = "IMAGE_BUCKET"
+bucket_name = "rss-images"
+
+[env.rss]
+name = "rss-collector-rss"
+main = "src/rss.ts"
