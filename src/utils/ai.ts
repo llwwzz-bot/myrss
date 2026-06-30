@@ -54,10 +54,12 @@ export async function generateAIInsights(
     if (!content) return empty;
 
     const parsed = JSON.parse(content);
+    const toStr = (v: any): string =>
+      Array.isArray(v) ? v.join('\n') : (typeof v === 'string' ? v : '');
     return {
-      summary: parsed.summary || '',
-      outline: parsed.outline || '',
-      viewpoints: parsed.viewpoints || '',
+      summary: toStr(parsed.summary),
+      outline: toStr(parsed.outline),
+      viewpoints: toStr(parsed.viewpoints),
     };
   } catch {
     return empty;

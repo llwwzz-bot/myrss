@@ -15,6 +15,8 @@ interface Env {
   SUPABASE_URL: string;
   SUPABASE_SERVICE_KEY: string;
   DEEPSEEK_API_KEY: string;
+  RENDER_PROXY_URL: string;
+  RENDER_PROXY_KEY: string;
 }
 
 export default {
@@ -93,6 +95,11 @@ async function processAndSave(env: Env, targetUrl: string, workerHost: string): 
 
     // AI 摘要
   const ai = await generateAIInsights(env.DEEPSEEK_API_KEY, article.title, article.plainText);
+    
+    
+    
+    
+    
 
   return insertArticle(env, {
     url: article.url,
@@ -117,7 +124,18 @@ async function handleDebug(req: Request, env: Env): Promise<Response> {
     const exists = await urlExists(env, testUrl);
     if (exists) return new Response(lines.join('\n') + '\n   已存在');
 
-    lines.push('2. 提取内容...');
+    const proxyOn = !!env.RENDER_PROXY_URL;
+    lines.push('2. 提取内容 (代理: ' + (proxyOn ? 'ON' : 'OFF') + ')...');
+    if (proxyOn) {
+      lines.push('   代理地址: ' + env.RENDER_PROXY_URL);
+      try {
+        const testResp = await fetch(env.RENDER_PROXY_URL + '/health');
+        const testJson: any = await testResp.json();
+        lines.push('   代理连通: ' + (testJson.ok ? 'OK' : 'FAIL'));
+      } catch (e: any) {
+        lines.push('   代理连通: FAIL - ' + (e?.message || 'unknown'));
+      }
+    }
     const host = new URL(req.url).host;
     const article = await extractContent(env, testUrl);
     lines.push(`   标题: ${article.title}`);
@@ -136,11 +154,16 @@ async function handleDebug(req: Request, env: Env): Promise<Response> {
     const finalContent = uploads.length > 0 ? replaceImageUrls(article.content, uploads) : article.content;
 
         // AI 摘要
-    lines.push('4. AI 分析...');
+    
     const ai = await generateAIInsights(env.DEEPSEEK_API_KEY, article.title, article.plainText);
-    if (ai.summary) lines.push('   摘要: ' + ai.summary);
-    if (ai.outline) lines.push('   目录: ' + ai.outline.replace(/\\n/g, '\\n         '));
-    if (ai.viewpoints) lines.push('   观点: ' + ai.viewpoints.replace(/\\n/g, '\\n         '));
+    
+    
+    
+    
+    
+    
+    
+    
     lines.push('5. 写入 Supabase...');
     const id = await insertArticle(env, {
       url: article.url, title: article.title, author: article.author,
