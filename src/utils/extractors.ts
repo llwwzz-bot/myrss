@@ -58,7 +58,7 @@ async function extractGeneric(url: string): Promise<Omit<ArticleData, 'platform'
   };
 }
 
-// ── 渲染代理提取（B站/知乎/公众号通用逻辑）──
+// ── 渲染代理提取（B站/知乎/公众号）—— 代理已返回干净内容+base64图片，跳过 Readability
 async function extractViaProxy(env: Env, url: string, platform: string): Promise<Omit<ArticleData, 'platform'>> {
   const result = await renderViaProxy(env, url, platform);
   if (!result || !result.html) {
@@ -67,29 +67,12 @@ async function extractViaProxy(env: Env, url: string, platform: string): Promise
     }
   }
 
-  try {
-    const { parseHTML } = await import('linkedom');
-    const { Readability } = await import('@mozilla/readability');
-    const { document: doc } = parseHTML(`<html><body>${result.html}</body></html>`);
-    const reader = new Readability(doc);
-    const parsed = reader.parse();
-    if (parsed && parsed.content) {
-      return {
-        url, title: parsed.title || result.title || '无标题',
-        author: parsed.byline || result.author || '',
-        publishedAt: new Date().toISOString(),
-        content: parsed.content,
-        plainText: parsed.textContent?.slice(0, 500) || '',
-      };
-    }
-  } catch { /* fall through */ }
+  const title = result.title || '无标题';
+  const author = result.author || '';
+  const content = result.html.startsWith('<') ? result.html : `<div>${result.html}</div>`;
+  const plainText = result.html.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().slice(0, 500);
 
-  return {
-    url, title: result.title || '无标题', author: result.author || '',
-    publishedAt: new Date().toISOString(),
-    content: `<div>${result.html}</div>`,
-    plainText: result.html.replace(/<[^>]*>/g, '').trim().slice(0, 500),
-  };
+  return { url, title, author, publishedAt: new Date().toISOString(), content, plainText };
 }
 
 // ── 公众号 ──
@@ -117,18 +100,6 @@ async function extractBilibili(env: Env, url: string): Promise<Omit<ArticleData,
 
 // ── 知乎 ──
 async function extractZhihu(env: Env, url: string): Promise<Omit<ArticleData, 'platform'>> {
-  const result = await renderViaProxy(env, url, 'zhihu');
-  if (result && result.html && !result.html.includes('40362') && !result.html.includes('暂时限制本次访问')) {
-    try {
-      const { parseHTML } = await import('linkedom');
-      const { Readability } = await import('@mozilla/readability');
-      const { document: doc } = parseHTML(`<html><body>${result.html}</body></html>`);
-      const parsed = (new Readability(doc)).parse();
-      if (parsed && parsed.content && parsed.title !== '无标题') {
-        return { url, title: parsed.title, author: parsed.byline || '知乎作者', publishedAt: new Date().toISOString(), content: parsed.content, plainText: parsed.textContent?.slice(0, 500) || '' };
-      }
-    } catch { /* fall through */ }
-  }
   return extractViaProxy(env, url, 'zhihu');
 }
 

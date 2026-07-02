@@ -1,20 +1,16 @@
 ﻿// ============================================================
 // RSS 渲染代理 —— Puppeteer 无头浏览器 HTTP 服务
-// 部署到国内云服务器，Workers Worker 调用此服务渲染页面
 // ============================================================
 
 const express = require('express');
 const puppeteer = require('puppeteer');
 
-// ====== 配置（部署时修改）======
 const PORT = process.env.PORT || 3456;
 const API_KEY = process.env.API_KEY || 'change-me-to-a-random-string';
-// ================================
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// 全局浏览器实例（复用，避免每次启动）
 let browser = null;
 
 async function getBrowser() {
@@ -33,16 +29,49 @@ async function getBrowser() {
   return browser;
 }
 
-// 鉴权中间件
 function auth(req, res, next) {
   const key = req.headers['x-api-key'] || req.query.key || '';
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-// ====== POST /render —— 渲染页面并返回 HTML ======
+// 下载图片转 base64（服务端国内 IP，不受防盗链影响）
+async function inlineImages(html, platform, limit = 20) {
+  const imgs = [...html.matchAll(/<img[^>]+src="([^"]+)"[^>]*>/gi)];
+  const seen = new Set();
+  const tasks = [];
+
+  for (const m of imgs) {
+    const url = m[1];
+    if (!url.startsWith('http') || seen.has(url) || seen.size >= limit) continue;
+    seen.add(url);
+    tasks.push((async () => {
+      try {
+        const resp = await fetch(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0.0.0 Safari/537.36',
+            'Referer': platform === 'bilibili' ? 'https://www.bilibili.com/'
+                     : platform === 'zhihu' ? 'https://www.zhihu.com/'
+                     : url,
+          },
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!resp.ok) return null;
+        const buf = Buffer.from(await resp.arrayBuffer());
+        const ct = resp.headers.get('content-type') || 'image/jpeg';
+        return { url, dataUri: `data:${ct};base64,${buf.toString('base64')}` };
+      } catch { return null; }
+    })());
+  }
+
+  const results = await Promise.all(tasks);
+  let out = html;
+  for (const r of results) {
+    if (r) out = out.replaceAll(r.url, r.dataUri);
+  }
+  return out;
+}
+
 app.post('/render', auth, async (req, res) => {
   const { url, platform } = req.body;
   if (!url) return res.status(400).json({ error: 'Missing url' });
@@ -52,28 +81,17 @@ app.post('/render', auth, async (req, res) => {
     const b = await getBrowser();
     page = await b.newPage();
 
-    // 根据平台设置 UA（国内大厂都检查 UA）
     const userAgents = {
-      wechat:
-        'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36 MicroMessenger/8.0.0',
-      zhihu:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
-      bilibili:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
+      wechat: 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36 MicroMessenger/8.0.0',
+      zhihu:  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
+      bilibili:'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
     };
-    const ua = userAgents[platform] || userAgents.bilibili;
-    await page.setUserAgent(ua);
+    await page.setUserAgent(userAgents[platform] || userAgents.bilibili);
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' });
 
-    // 额外请求头
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    });
-
-    // 根据平台设置 Referer
     if (platform === 'bilibili') {
       await page.setExtraHTTPHeaders({
         'Referer': 'https://www.bilibili.com/',
-        'Origin': 'https://www.bilibili.com',
         ...(await page.extraHTTPHeaders?.() || {}),
       });
     }
@@ -83,49 +101,80 @@ app.post('/render', auth, async (req, res) => {
       timeout: 25000,
     });
 
-    // 等待关键内容元素
     const selectors = {
       wechat: '#js_content',
-      zhihu: '.Post-RichText, .RichText',
+      zhihu: '.Post-RichText, .RichText, .RichContent-inner',
       bilibili: '.article-content, #read-article-holder',
     };
     const sel = selectors[platform];
     if (sel) {
-      try {
-        await page.waitForSelector(sel, { timeout: 8000 });
-      } catch {
-        // 没等到也不失败——有些页面可能没有目标选择器
-      }
+      try { await page.waitForSelector(sel, { timeout: 10000 }); } catch {}
     }
 
+    // 滚动触发懒加载
+    await page.evaluate(async () => {
+      const delay = (ms) => new Promise(r => setTimeout(r, ms));
+      const h = document.documentElement.scrollHeight;
+      for (let y = 0; y < h; y += 500) {
+        window.scrollTo(0, y);
+        await delay(150);
+      }
+      window.scrollTo(0, 0);
+      await delay(500);
+    });
+
+    await page.waitForNetworkIdle({ timeout: 10000, idleTime: 1000 }).catch(() => {});
+
     const result = await page.evaluate((p) => {
-      let title = document.title || '';
-      let content = '';
-      let author = '';
+      function absUrl(src) {
+        if (!src) return '';
+        if (/^(https?:|data:|\/\/)/i.test(src)) return src.startsWith('//') ? 'https:' + src : src;
+        try { return new URL(src, location.href).href; } catch { return src; }
+      }
+
+      // 修复懒加载
+      document.querySelectorAll('img').forEach(img => {
+        const realSrc = img.getAttribute('data-src')
+          || img.getAttribute('data-original')
+          || img.getAttribute('data-lazy-src')
+          || img.getAttribute('src');
+        if (realSrc && !realSrc.startsWith('data:')) {
+          img.setAttribute('src', absUrl(realSrc));
+        }
+      });
+
+      let title = '', author = '', content = '';
 
       if (p === 'wechat') {
-        title = document.querySelector('#activity-name')?.textContent?.trim() || title;
+        title = document.querySelector('#activity-name')?.textContent?.trim() || document.title || '';
         content = document.querySelector('#js_content')?.innerHTML || '';
         author = document.querySelector('#js_name')?.textContent?.trim() || '';
       } else if (p === 'zhihu') {
-        title = document.querySelector('h1.Post-Title, h1.QuestionHeader-title')?.textContent?.trim() || title;
-        content = document.querySelector('.Post-RichText, .RichText')?.innerHTML || '';
-        author = document.querySelector('.AuthorInfo-name span')?.textContent?.trim() || '';
+        title = (document.querySelector('h1.Post-Title') || document.querySelector('h1.QuestionHeader-title') || document.querySelector('.QuestionHeader-title') || document.querySelector('.ContentItem-title'))?.textContent?.trim() || document.title || '';
+        content = (document.querySelector('.Post-RichText') || document.querySelector('.RichText') || document.querySelector('.RichContent-inner'))?.innerHTML || '';
+        const authorEl = document.querySelector('.AuthorInfo-name span, .AuthorInfo-name');
+        author = authorEl?.textContent?.trim() || '';
       } else if (p === 'bilibili') {
-        title = (document.querySelector('h1') || document.querySelector('.title'))?.textContent?.trim() || title;
+        title = (document.querySelector('h1.title') || document.querySelector('.article-title') || document.querySelector('[data-title]') || document.querySelector('h1'))?.textContent?.trim() || document.title || '';
         content = (document.querySelector('.article-content') || document.querySelector('#read-article-holder'))?.innerHTML || '';
-        author = (document.querySelector('.username') || document.querySelector('.up-name'))?.textContent?.trim() || '';
+        author = (document.querySelector('.up-name') || document.querySelector('.username') || document.querySelector('.author-name'))?.textContent?.trim() || '';
       }
 
-      return { title, content, author, url: location.href };
+      return {
+        title: title.replace(/\s+/g, ' ').trim(),
+        content,
+        author: author.replace(/\s+/g, ' ').trim(),
+      };
     }, platform);
 
-    res.json({
-      ok: true,
-      html: result.content || document.body?.innerHTML,
-      title: result.title,
-      author: result.author,
-    });
+    let html = result.content || await page.evaluate(() => document.body?.innerHTML || '');
+
+    // B站/知乎/公众号：服务端下载图片转 base64（绕过防盗链）
+    if (['bilibili', 'zhihu', 'wechat'].includes(platform)) {
+      html = await inlineImages(html, platform);
+    }
+
+    res.json({ ok: true, html, title: result.title, author: result.author });
   } catch (err) {
     console.error(`Render failed for ${url}:`, err.message);
     res.status(500).json({ error: err.message });
@@ -134,18 +183,15 @@ app.post('/render', auth, async (req, res) => {
   }
 });
 
-// ====== GET /health —— 健康检查 ======
 app.get('/health', (req, res) => {
   res.json({ ok: true, browser: !!(browser && browser.isConnected()) });
 });
 
-// ====== 启动 ======
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Render proxy running on http://0.0.0.0:${PORT}`);
   console.log(`API Key required in X-API-Key header`);
 });
 
-// 优雅退出
 process.on('SIGINT', async () => {
   if (browser) await browser.close();
   process.exit(0);
