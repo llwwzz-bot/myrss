@@ -35,25 +35,63 @@ export async function uploadImageToR2(
   }
 }
 
-/** 提取正文中所有图片 URL */
+/** 上传 base64 data URI 图片到 R2 */
+export async function uploadBase64ToR2(
+  bucket: R2Bucket,
+  workerHost: string,
+  dataUri: string,
+  articleId: string,
+  index: number
+): Promise<ImageUploadResult | null> {
+  try {
+    const match = dataUri.match(/^data:(image\/\w+);base64,(.+)$/);
+    if (!match) return null;
+
+    const mimeType = match[1];               // e.g. "image/webp"
+    const base64Data = match[2];
+    const binaryStr = atob(base64Data);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+
+    const ext = mimeType.includes('png') ? 'png'
+      : mimeType.includes('webp') ? 'webp'
+      : mimeType.includes('gif') ? 'gif'
+      : 'jpg';
+
+    const key = `articles/${articleId}/${index}.${ext}`;
+    await bucket.put(key, bytes, { httpMetadata: { contentType: mimeType } });
+
+    return {
+      originalUrl: dataUri,
+      r2Url: `https://${workerHost}/img/${articleId}/${index}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 提取正文中所有图片 URL（http + base64 data URI） */
 export function extractImageUrls(html: string): string[] {
   const urls: string[] = [];
   const regex = /<img[^>]+src=["']([^"']+)["']/gi;
   let match;
   while ((match = regex.exec(html)) !== null) {
     const src = match[1];
-    if (src.startsWith('http') && !urls.includes(src)) {
+    if ((src.startsWith('http') || src.startsWith('data:image/')) && !urls.includes(src)) {
       urls.push(src);
     }
   }
-  return urls.slice(0, 30); // 最多 10 张，避免超时
+  return urls.slice(0, 30);
 }
 
-/** 替换正文中的图片链接 */
+/** 替换正文中的图片链接（支持 http + data URI） */
 export function replaceImageUrls(html: string, uploads: ImageUploadResult[]): string {
   let result = html;
   for (const upload of uploads) {
-    result = result.replaceAll(upload.originalUrl, upload.r2Url);
+    // data URI 可能超长，用 split/join 比 replaceAll 更可靠
+    result = result.split(upload.originalUrl).join(upload.r2Url);
   }
   return result;
 }

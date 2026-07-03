@@ -1,11 +1,12 @@
 ﻿// ============================================================
-// RSS Collector Worker —— Webhook + Queue Consumer + 图片服务
+// RSS Collector Worker —— Webhook + Queue Consumer + 图片服务 + Obsidian
 // ============================================================
 import type { TelegramMessage, CollectTask } from './types';
 import { extractContent } from './utils/extractors';
 import { insertArticle, urlExists } from './utils/supabase';
 import { generateAIInsights } from './utils/ai';
-import { uploadImageToR2, extractImageUrls, replaceImageUrls } from './utils/r2';
+import { uploadImageToR2, uploadBase64ToR2, extractImageUrls, replaceImageUrls } from './utils/r2';
+import { generateObsidianMd, pushToGithub, obsidianFilePath } from './utils/obsidian';
 
 interface Env {
   TELEGRAM_BOT_TOKEN: string;
@@ -17,13 +18,14 @@ interface Env {
   DEEPSEEK_API_KEY: string;
   RENDER_PROXY_URL: string;
   RENDER_PROXY_KEY: string;
+  GITHUB_TOKEN: string;
+  GITHUB_REPO: string;
 }
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
 
-    // R2 图片服务
     if (url.pathname.startsWith('/img/')) {
       return serveImage(url, env);
     }
@@ -59,10 +61,8 @@ export default {
   },
 };
 
-// ── R2 图片服务 ──
 async function serveImage(url: URL, env: Env): Promise<Response> {
   const key = url.pathname.replace('/img/', 'articles/').replace(/\/$/, '');
-  // 尝试常见扩展名
   for (const ext of ['jpg', 'jpeg', 'png', 'webp', 'gif']) {
     const obj = await env.IMAGE_BUCKET.get(`${key}.${ext}`);
     if (obj) {
@@ -77,31 +77,29 @@ async function serveImage(url: URL, env: Env): Promise<Response> {
   return new Response('Not Found', { status: 404 });
 }
 
-// ── 核心处理：提取 → 下载图片 → 存库 ──
 async function processAndSave(env: Env, targetUrl: string, workerHost: string): Promise<string> {
   const articleId = crypto.randomUUID();
   const article = await extractContent(env, targetUrl);
 
-  // 提取并上传图片
   const imgUrls = extractImageUrls(article.content);
   const uploads: Array<{ originalUrl: string; r2Url: string }> = [];
+
   for (let i = 0; i < imgUrls.length; i++) {
-    const result = await uploadImageToR2(env.IMAGE_BUCKET, workerHost, imgUrls[i], articleId, i);
+    const imgUrl = imgUrls[i];
+    let result = null;
+    if (imgUrl.startsWith('data:image/')) {
+      result = await uploadBase64ToR2(env.IMAGE_BUCKET, workerHost, imgUrl, articleId, i);
+    } else {
+      result = await uploadImageToR2(env.IMAGE_BUCKET, workerHost, imgUrl, articleId, i);
+    }
     if (result) uploads.push(result);
   }
 
-  // 替换图片链接
   const finalContent = uploads.length > 0 ? replaceImageUrls(article.content, uploads) : article.content;
 
-    // AI 摘要
   const ai = await generateAIInsights(env.DEEPSEEK_API_KEY, article.title, article.plainText);
-    
-    
-    
-    
-    
 
-  return insertArticle(env, {
+  const id = await insertArticle(env, {
     url: article.url,
     title: article.title,
     author: article.author,
@@ -109,11 +107,26 @@ async function processAndSave(env: Env, targetUrl: string, workerHost: string): 
     content: finalContent,
     plainText: article.plainText,
     platform: article.platform,
-    coverImage: article.coverImage, summary: ai.summary, outline: ai.outline, viewpoints: ai.viewpoints,
+    coverImage: article.coverImage,
+    summary: ai.summary,
+    outline: ai.outline,
+    viewpoints: ai.viewpoints,
   }, articleId);
+
+  if (env.GITHUB_TOKEN && env.GITHUB_REPO) {
+    try {
+      const md = generateObsidianMd(article, ai, uploads);
+      const filePath = obsidianFilePath(article, ai);
+      const pushResult = await pushToGithub(env, filePath, md);
+      if (!pushResult.ok) console.warn(`GitHub push failed: ${filePath} - ${pushResult.error}`);
+    } catch (e: any) {
+      console.warn(`Obsidian flow failed: ${e.message}`);
+    }
+  }
+
+  return id;
 }
 
-// ── 调试端点 ──
 async function handleDebug(req: Request, env: Env): Promise<Response> {
   const testUrl = new URL(req.url).searchParams.get('url');
   if (!testUrl) return new Response('缺少 ?url=', { status: 400 });
@@ -141,36 +154,54 @@ async function handleDebug(req: Request, env: Env): Promise<Response> {
     lines.push(`   标题: ${article.title}`);
     lines.push(`   平台: ${article.platform}`);
 
-    // 图片处理
     const imgUrls = extractImageUrls(article.content);
     lines.push(`3. 处理图片 (${imgUrls.length} 张)...`);
     const uploads: Array<{ originalUrl: string; r2Url: string }> = [];
     for (let i = 0; i < imgUrls.length; i++) {
-      const r = await uploadImageToR2(env.IMAGE_BUCKET, host, imgUrls[i], 'debug', i);
+      const imgUrl = imgUrls[i];
+      let r = null;
+      if (imgUrl.startsWith('data:image/')) {
+        r = await uploadBase64ToR2(env.IMAGE_BUCKET, host, imgUrl, 'debug', i);
+      } else {
+        r = await uploadImageToR2(env.IMAGE_BUCKET, host, imgUrl, 'debug', i);
+      }
       if (r) uploads.push(r);
-      lines.push(`   [${i + 1}/${imgUrls.length}] ${r ? 'OK' : 'FAIL'}: ${imgUrls[i].slice(0, 60)}...`);
+      const prefix = imgUrl.startsWith('data:') ? 'base64' : 'http';
+      lines.push(`   [${i + 1}/${imgUrls.length}] ${r ? 'OK' : 'FAIL'} (${prefix}): ${imgUrl.slice(0, 60)}...`);
     }
 
     const finalContent = uploads.length > 0 ? replaceImageUrls(article.content, uploads) : article.content;
 
-        // AI 摘要
-    
+    lines.push('4. AI 分析...');
     const ai = await generateAIInsights(env.DEEPSEEK_API_KEY, article.title, article.plainText);
-    
-    
-    
-    
-    
-    
-    
-    
+    lines.push(`   摘要: ${(ai.summary || '').slice(0, 80)}...`);
+    lines.push(`   技术要点: ${(ai.techPoints || '').slice(0, 80)}...`);
+    lines.push(`   标签: [${ai.tags.join(', ')}]`);
+
     lines.push('5. 写入 Supabase...');
     const id = await insertArticle(env, {
       url: article.url, title: article.title, author: article.author,
       publishedAt: article.publishedAt, content: finalContent,
-      plainText: article.plainText, platform: article.platform, coverImage: article.coverImage, summary: ai.summary, outline: ai.outline, viewpoints: ai.viewpoints,
+      plainText: article.plainText, platform: article.platform, coverImage: article.coverImage,
+      summary: ai.summary, outline: ai.outline, viewpoints: ai.viewpoints,
     });
     lines.push(`   成功! ID: ${id}`);
+
+    if (env.GITHUB_TOKEN && env.GITHUB_REPO) {
+      lines.push('6. 推送 Obsidian...');
+      try {
+        const md = generateObsidianMd(article, ai, uploads);
+        const filePath = obsidianFilePath(article, ai);
+        const pushResult = await pushToGithub(env, filePath, md);
+        lines.push(`   ${pushResult.ok ? 'OK' : 'FAIL'}: ${filePath}`);
+        if (!pushResult.ok && pushResult.error) lines.push(`   原因: ${pushResult.error}`);
+      } catch (e: any) {
+        lines.push(`   FAIL: ${e.message}`);
+      }
+    } else {
+      lines.push('6. 跳过 Obsidian (未配置 GITHUB_TOKEN/GITHUB_REPO)');
+    }
+
     return new Response(lines.join('\n'));
   } catch (err: any) {
     lines.push(`X 失败: ${err?.message || err}`);
@@ -178,7 +209,6 @@ async function handleDebug(req: Request, env: Env): Promise<Response> {
   }
 }
 
-// ── Telegram Webhook ──
 async function handleTelegramWebhook(req: Request, env: Env): Promise<Response> {
   try {
     const body: { message?: TelegramMessage } = await req.json();
@@ -223,7 +253,6 @@ async function sendTelegram(env: Env, chatId: number, text: string): Promise<boo
   return result.ok === true;
 }
 
-// 从环境推断 Worker 域名（queue 上下文没有请求 URL）
 function reqHost(env: Env): string {
   return 'rss-collector.liwenzhestudy.workers.dev';
 }

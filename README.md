@@ -1,231 +1,193 @@
-﻿# RSS 个人采集系统 —— MVP 实现指南
+﻿# RSS 个人采集系统
 
-## 系统架构
+Telegram 发链接 → AI 分析 → Supabase + Obsidian 知识库 + RSS 阅读器
+
+## 架构
 
 ```
-手机 Telegram Bot ──发送链接──▶ Cloudflare Worker (Webhook)
-                                      │
-                                      ▼
-                              Cloudflare Queue (任务队列)
-                                      │
-                                      ▼
-                              Cloudflare Worker (Processor)
-                                   │          │
-                              ┌────┘          └────┐
-                              ▼                    ▼
-                       Cloudflare R2          Supabase
-                       (图片存储)           (文章数据库)
+Telegram Bot ──▶ CF Worker (webhook) ──▶ Queue ──▶ 内容提取
                                                       │
-                                                      ▼
-                                            Cloudflare Worker (RSS)
-                                                      │
-                                                      ▼
-                                              RSS 阅读器 (Read You / Fluent Reader)
+                          ┌───────────────────────────┤
+                          ▼                           ▼
+                   Puppeteer 代理                Readability
+                   (B站/知乎/公众号)             (通用网站)
+                          │                           │
+                          └───────────┬───────────────┘
+                                      ▼
+                              DeepSeek AI
+                          (摘要·目录·观点·技术要点)
+                                      │
+                          ┌───────────┼───────────┐
+                          ▼           ▼           ▼
+                      Supabase     GitHub      RSS 阅读器
+                     (文章存档)  (Obsidian)  (Fluent Reader)
 ```
 
-三步式流程：**采集 → 清洗 → 呈现**
+## 功能
 
----
+| 功能 | 说明 |
+|------|------|
+| 🤖 Telegram Bot | 发链接即采集，自动去重 |
+| 📄 通用网站 | Readability 正文提取 |
+| 🎬 B站/知乎/公众号 | Puppeteer 渲染代理（国内服务器 + Cloudflare Tunnel） |
+| 🖼️ 图片处理 | 自动搬 R2，防盗链图片转 base64 再上传 |
+| 🧠 AI 分析 | DeepSeek：摘要、目录、观点、技术要点、标签 |
+| 📚 Supabase | 结构化存储，全文检索 |
+| 📡 RSS | Fluent Reader / Read You 随时阅读 |
+| 🗂️ Obsidian | 自动生成 .md → GitHub → Obsidian Git 同步 |
 
 ## 前置准备
 
-### 你需要注册以下服务（均提供免费额度）
-
 | 服务 | 用途 | 免费额度 |
 |------|------|---------|
-| [Cloudflare](https://dash.cloudflare.com) | Worker + Queue + R2 + Browser Rendering | Workers 10万次/天, R2 10GB |
-| [Supabase](https://supabase.com) | 文章数据库 | 500MB 数据库, 无限 API 请求 |
-| Telegram [@BotFather](https://t.me/BotFather) | 创建 Bot | 免费 |
+| [Cloudflare](https://dash.cloudflare.com) | Worker + Queue + R2 | 10万次/天, 10GB R2 |
+| [Supabase](https://supabase.com) | 数据库 | 500MB, 无限 API |
+| Telegram [@BotFather](https://t.me/BotFather) | Bot | 免费 |
+| [DeepSeek](https://platform.deepseek.com) | AI 分析 | 送 500万 tokens |
+| GitHub | Obsidian 同步 | 免费 |
+| 国内云服务器 | 渲染代理（B站/知乎） | 阿里云约 ¥60/月 |
 
-### 本地环境
+## 部署
+
+### 1. 本地环境
 
 ```bash
-# 安装 Node.js 18+
-node -v
-
-# 安装 Wrangler CLI
+node -v          # Node 18+
 npm install -g wrangler
 wrangler login
 ```
 
----
+### 2. Telegram Bot
 
-## 第一步：创建 Telegram Bot
+`@BotFather` → `/newbot` → 获取 Token。`@userinfobot` → 获取你的 User ID。
 
-1. 在 Telegram 中搜索 `@BotFather`
-2. 发送 `/newbot`，按提示设置 Bot 名称和用户名
-3. 获得 **Bot Token**（格式：`123456:ABC-DEF1234ghijk`）
-4. 获取你的 Telegram User ID：
-   - 搜索 `@userinfobot`，发送任意消息即可获得你的数字 ID
-5. **将 Bot Token 和 User ID 记下来**
+### 3. Supabase
 
----
+创建项目 → SQL Editor 执行 `sql/schema.sql` → Project Settings → API 复制 `Project URL` 和 `service_role key`。
 
-## 第二步：配置 Supabase
+### 4. DeepSeek API
 
-### 2.1 创建项目
+[platform.deepseek.com](https://platform.deepseek.com) → API Keys → 创建 Key。
 
-1. 登录 [supabase.com](https://supabase.com)，点击 **New Project**
-2. 设置项目名（如 `rss-collector`），设置数据库密码并记下
-3. 选择区域（建议选 `ap-southeast-1` 新加坡，国内访问较快）
-4. 等待项目创建完成（约 2 分钟）
-
-### 2.2 创建数据表
-
-1. 进入项目 → **SQL Editor** → **New Query**
-2. 将 `sql/schema.sql` 的内容粘贴进去，点击 **Run**
-3. 确认左侧出现 `articles` 表
-
-### 2.3 获取 API 密钥
-
-1. 进入 **Project Settings** → **API**
-2. 复制以下两个值：
-   - **Project URL**（如 `https://xxxxx.supabase.co`）
-   - **service_role key**（以 `eyJ...` 开头）⚠️ 这个 key 权限最高，不要公开
-
----
-
-## 第三步：配置 Cloudflare
-
-### 3.1 创建 R2 存储桶
+### 5. Cloudflare 资源
 
 ```bash
 wrangler r2 bucket create rss-images
-```
-
-### 3.2 创建 Queue
-
-```bash
 wrangler queues create collect-queue
 ```
 
-### 3.3 配置 wrangler.toml
+### 6. 配置环境变量
 
-打开项目根目录的 `wrangler.toml`，填入你的实际值：
+编辑 `wrangler.toml`：
 
 ```toml
 [vars]
-TELEGRAM_BOT_TOKEN = "你的Bot Token"
-ALLOWED_USERS = "你的Telegram User ID"
+TELEGRAM_BOT_TOKEN = "你的 Bot Token"
+ALLOWED_USERS = "你的 Telegram User ID"
 ```
 
-部署后 Cloudflare 自动分配 `workers.dev` 子域名，无需手动配置路由。
-
-### 3.4 设置 Secret 环境变量
+设置 Secrets：
 
 ```bash
-# Supabase 配置
-wrangler secret put SUPABASE_URL
-# 输入: https://xxxxx.supabase.co
-
-wrangler secret put SUPABASE_SERVICE_KEY
-# 输入: eyJ...你的 service_role key
+wrangler secret put SUPABASE_URL           # https://xxx.supabase.co
+wrangler secret put SUPABASE_SERVICE_KEY   # eyJ...
+wrangler secret put DEEPSEEK_API_KEY       # sk-...
+wrangler secret put RENDER_PROXY_URL       # https://rss-render.你的域名
+wrangler secret put RENDER_PROXY_KEY       # 代理 API Key
+wrangler secret put GITHUB_TOKEN           # ghp_...（contents write 权限）
+wrangler secret put GITHUB_REPO            # 用户名/仓库名
 ```
-# 输入: eyJ...你的 service_role key
-```
 
----
+### 7. 渲染代理服务器
 
-## 第四步：部署
-
-### 4.1 安装依赖
+在阿里云等国内服务器上部署 `render-proxy/`：
 
 ```bash
-cd rss
+cd render-proxy
 npm install
+npm install -g pm2
+pm2 start ecosystem.config.js
+pm2 save
 ```
 
-### 4.2 部署到 Cloudflare
+首次需配置 Cloudflare Named Tunnel：
 
 ```bash
-# 部署主 Worker（Webhook + Queue Consumer）
-npx wrangler deploy
-
-# 部署 RSS Worker
-npx wrangler deploy --env rss
+cloudflared tunnel login
+cloudflared tunnel create rss-render
+cloudflared tunnel route dns rss-render rss-render.你的域名
+cat > ~/.cloudflared/config.yml << EOF
+tunnel: <tunnel-id>
+credentials-file: /root/.cloudflared/<uuid>.json
+ingress:
+  - hostname: rss-render.你的域名
+    service: http://localhost:3456
+  - service: http_status:404
+EOF
+pm2 start ecosystem.config.js
 ```
 
-部署成功后你会获得类似 `rss-collector.你的用户名.workers.dev` 的域名。
-
----
-
-## 第五步：设置 Telegram Webhook
-
-将 Bot 的消息转发到你的 Worker：
+### 8. 部署 Worker
 
 ```bash
-curl -X POST "https://api.telegram.org/bot<你的Bot Token>/setWebhook" \
+npx wrangler deploy            # 主 Worker
+npx wrangler deploy --env rss  # RSS Worker
+```
+
+### 9. 设置 Webhook
+
+```bash
+curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
   -H "Content-Type: application/json" \
   -d '{"url": "https://rss-collector.你的域名.workers.dev/webhook"}'
 ```
 
-验证是否设置成功：
-```bash
-curl "https://api.telegram.org/bot<你的Bot Token>/getWebhookInfo"
-```
+### 10. Obsidian 配置
 
----
+1. GitHub 上创建仓库
+2. Clone 到本地作为 Obsidian Vault
+3. 装 [Obsidian Git](https://github.com/Vinzent03/obsidian-git) 插件
+4. 插件设置中开启 **Auto pull interval**（如 5 分钟）
+5. 如在国内，配置代理或使用 Gitee 镜像
 
-## 第六步：导入 RSS 阅读器
+## 使用
 
-### 电脑端：Fluent Reader
-1. 下载 [Fluent Reader](https://github.com/yang991178/fluent-reader)
-2. 添加订阅源，地址为：`https://rss-collector.你的域名.workers.dev/rss`
+1. 手机上分享链接 → Telegram → 发给你的 Bot
+2. Bot 回复确认，后台自动处理
+3. RSS 阅读器（Fluent Reader / Read You）订阅 `https://rss-collector.你的域名.workers.dev/rss`
+4. Obsidian 自动同步 Markdown 笔记
 
-### 安卓端：Read You
-1. 下载 [Read You](https://github.com/Ashinch/ReadYou)（支持自定义字体）
-2. 添加订阅源，同上地址
-
----
-
-## 使用流程
-
-1. **手机上刷到好文章** → 点分享 → 选 Telegram → 发送给你的 Bot
-2. **Bot 回复**「✅ 已收到链接，正在后台处理…」
-3. **后台自动**：提取正文 → 存到 Supabase → 图片搬上 R2
-4. **空闲时打开阅读器** → 同步 RSS → 阅读规整排版的文章
-
----
-
-## 项目文件说明
+## 项目结构
 
 ```
 rss/
-├── wrangler.toml              # Cloudflare 配置（需修改填入实际值）
-├── package.json               # 依赖
-├── tsconfig.json              # TypeScript 配置
-├── sql/
-│   └── schema.sql             # Supabase 建表 SQL
+├── wrangler.toml
+├── package.json
+├── tsconfig.json
+├── sql/schema.sql
+├── render-proxy/               # 国内服务器 Puppeteer 渲染代理
+│   ├── index.js
+│   ├── ecosystem.config.js
+│   └── package.json
 └── src/
-    ├── types.ts               # 共享类型定义
-    ├── webhook.ts             # Telegram Webhook 入口
-    ├── processor.ts           # Queue 消费者（内容提取入库）
-    ├── rss.ts                 # RSS 生成 Worker
+    ├── types.ts
+    ├── webhook.ts              # Worker 主入口（Webhook + Queue + Debug）
+    ├── rss.ts                  # RSS 生成
     └── utils/
-        ├── supabase.ts        # Supabase 客户端 & 操作
-        ├── extractors.ts      # 内容提取器（通用/公众号/Twitter）
-        └── r2.ts              # R2 图片存储
+        ├── extractors.ts       # 内容提取（通用 + 渲染代理）
+        ├── ai.ts               # DeepSeek AI 分析
+        ├── supabase.ts         # Supabase 操作
+        ├── r2.ts               # R2 图片存储（含 base64 支持）
+        └── obsidian.ts         # Obsidian MD 生成 + GitHub 推送
 ```
-
----
-
-## 扩展方向
-
-- **飞书机器人**：修改 webhook 支持飞书 Webhook 格式
-- **AI 摘要**：在 processor 中加入 OpenAI API 调用，自动生成文章摘要
-- **分类标签**：用 AI 自动打标签，在阅读器中按分类筛选
-- **全文搜索**：利用 Supabase 全文索引 + 自定义搜索界面
-- **定时抓取**：用 Cloudflare Cron Trigger 定时抓取关注的博主/RSS 源
-
----
 
 ## 常见问题
 
-**Q: 为什么用 Cloudflare Browser Rendering 提取公众号？**
-A: 微信公众号文章需要微信 UA 才能看到完整内容，且内容由 JS 动态渲染，普通 HTTP 请求拿不到。Browser Rendering 是 Cloudflare 提供的无头浏览器服务。
+**Q: B站/知乎图片不显示？**
+A: 渲染代理已内置 base64 转 R2。检查 Worker 的 `/debug?url=...` 端点输出。
 
-**Q: Queue 消费失败了怎么办？**
-A: Cloudflare Queue 默认会重试。如果一直失败，可以配置 Dead Letter Queue（DLQ）来捕获失败消息。
+**Q: Worker 返回 502？**
+A: 通常是 AI 调用超时或 Render 代理不可达。检查 `npx wrangler tail` 日志。
 
-**Q: 免费额度够用吗？**
-A: 个人使用完全够。Cloudflare Workers 每天 10 万次请求，Supabase 500MB 数据库存储数千篇文章绰绰有余。
+**Q: 代理连通性 FAIL？**
+A: 检查服务器 `npx pm2 list` 确保 `rss-render-proxy` 和 `cloudflared-tunnel` 都在线。
