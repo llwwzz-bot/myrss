@@ -4,7 +4,7 @@
 import type { TelegramMessage, CollectTask } from './types';
 import { extractContent } from './utils/extractors';
 import { insertArticle, urlExists } from './utils/supabase';
-import { generateAIInsights } from './utils/ai';
+import { generateAIInsights, generateObsidianDoc } from './utils/ai';
 import { uploadImageToR2, uploadBase64ToR2, extractImageUrls, replaceImageUrls } from './utils/r2';
 import { generateObsidianMd, pushToGithub, obsidianFilePath } from './utils/obsidian';
 
@@ -97,7 +97,13 @@ async function processAndSave(env: Env, targetUrl: string, workerHost: string): 
 
   const finalContent = uploads.length > 0 ? replaceImageUrls(article.content, uploads) : article.content;
 
+  // 链路 1: 通用摘要（Supabase / RSS）
   const ai = await generateAIInsights(env.DEEPSEEK_API_KEY, article.title, article.plainText);
+
+  // 链路 2: 分类 + 生产型文档（Obsidian）—— 并行调用
+  const obsidianPromise = env.GITHUB_TOKEN && env.GITHUB_REPO
+    ? generateObsidianDoc(env.DEEPSEEK_API_KEY, article.title, article.plainText)
+    : Promise.resolve(null);
 
   const id = await insertArticle(env, {
     url: article.url,
@@ -113,9 +119,10 @@ async function processAndSave(env: Env, targetUrl: string, workerHost: string): 
     viewpoints: ai.viewpoints,
   }, articleId);
 
-  if (env.GITHUB_TOKEN && env.GITHUB_REPO) {
+  const obsidianDoc = await obsidianPromise;
+  if (obsidianDoc) {
     try {
-      const md = generateObsidianMd(article, ai, uploads);
+      const md = generateObsidianMd(article, ai, obsidianDoc, uploads);
       const filePath = obsidianFilePath(article, ai);
       const pushResult = await pushToGithub(env, filePath, md);
       if (!pushResult.ok) console.warn(`GitHub push failed: ${filePath} - ${pushResult.error}`);
@@ -172,11 +179,21 @@ async function handleDebug(req: Request, env: Env): Promise<Response> {
 
     const finalContent = uploads.length > 0 ? replaceImageUrls(article.content, uploads) : article.content;
 
-    lines.push('4. AI 分析...');
+    // 链路 1: 通用摘要
+    lines.push('4. AI 分析 (链路 1: Supabase)...');
     const ai = await generateAIInsights(env.DEEPSEEK_API_KEY, article.title, article.plainText);
     lines.push(`   摘要: ${(ai.summary || '').slice(0, 80)}...`);
     lines.push(`   技术要点: ${(ai.techPoints || '').slice(0, 80)}...`);
     lines.push(`   标签: [${ai.tags.join(', ')}]`);
+
+    // 链路 2: Obsidian 分类文档
+    if (env.GITHUB_TOKEN && env.GITHUB_REPO) {
+      lines.push('4b. AI 分类 (链路 2: Obsidian)...');
+    }
+    const aiStart = Date.now();
+    const obsidianDocPromise = env.GITHUB_TOKEN && env.GITHUB_REPO
+      ? generateObsidianDoc(env.DEEPSEEK_API_KEY, article.title, article.plainText)
+      : Promise.resolve(null);
 
     lines.push('5. 写入 Supabase...');
     const id = await insertArticle(env, {
@@ -187,10 +204,12 @@ async function handleDebug(req: Request, env: Env): Promise<Response> {
     });
     lines.push(`   成功! ID: ${id}`);
 
-    if (env.GITHUB_TOKEN && env.GITHUB_REPO) {
+    const obsidianDoc = await obsidianDocPromise;
+    if (obsidianDoc) {
+      lines.push(`   文档类型: ${obsidianDoc.type} (${Date.now() - aiStart}ms)`);
       lines.push('6. 推送 Obsidian...');
       try {
-        const md = generateObsidianMd(article, ai, uploads);
+        const md = generateObsidianMd(article, ai, obsidianDoc, uploads);
         const filePath = obsidianFilePath(article, ai);
         const pushResult = await pushToGithub(env, filePath, md);
         lines.push(`   ${pushResult.ok ? 'OK' : 'FAIL'}: ${filePath}`);
@@ -199,7 +218,7 @@ async function handleDebug(req: Request, env: Env): Promise<Response> {
         lines.push(`   FAIL: ${e.message}`);
       }
     } else {
-      lines.push('6. 跳过 Obsidian (未配置 GITHUB_TOKEN/GITHUB_REPO)');
+      lines.push('6. 跳过 Obsidian (未配置)');
     }
 
     return new Response(lines.join('\n'));
